@@ -97,7 +97,16 @@ def _clear_eval_state() -> None:
 # PULL PERSISTENCE (survives mid-pull reconnects — Trakstar batch can run 20min)
 # ─────────────────────────────────────────────
 
-_PULL_PERSIST_KEYS = ("pulled_resumes",)
+_PULL_PERSIST_KEYS = (
+    "pulled_resumes",
+    # Tag every persisted pull with the opening it came from. Without this,
+    # a persisted pull becomes a silent landmine when the user later switches
+    # openings — the eval would happily score sales resumes against a finance
+    # rubric (real bug, May 2026) because the eval block reads from
+    # pulled_resumes regardless of which opening is currently selected.
+    "pulled_opening_id",
+    "pulled_opening_title",
+)
 
 
 def _persist_pull_state() -> None:
@@ -293,9 +302,27 @@ _restore_pull_state()
 if st.session_state.get("_pull_restored_from"):
     saved_at = st.session_state["_pull_restored_from"]
     n = len(st.session_state.get("pulled_resumes") or {})
+    pulled_oid = st.session_state.get("pulled_opening_id") or ""
+    pulled_title = st.session_state.get("pulled_opening_title") or ""
+    if pulled_oid or pulled_title:
+        opening_label = f"**{pulled_title}** (ID: {pulled_oid})" if pulled_title else f"opening ID {pulled_oid}"
+        msg = (
+            f"Restored {n} pulled resumes for {opening_label} "
+            f"from a previous session (saved {saved_at}). "
+            f"⚠️ If you switch to a different opening, click **Discard** before evaluating "
+            f"or these resumes will be scored against the new opening's rubric."
+        )
+    else:
+        # Older pulls (pre-fix) have no opening tag — flag explicitly.
+        msg = (
+            f"Restored {n} pulled resumes from a previous session (saved {saved_at}). "
+            f"⚠️ Source opening unknown (pulled before opening-tagging shipped). "
+            f"If you're not 100% sure these match your current opening, click **Discard** "
+            f"and re-pull."
+        )
     col_a, col_b = st.columns([5, 1])
     with col_a:
-        st.info(f"Restored {n} pulled resumes from a previous session (saved {saved_at}).")
+        st.warning(msg)
     with col_b:
         if st.button("Discard", key="discard_pull_restored"):
             _clear_pull_state()
@@ -531,6 +558,11 @@ with col2:
                         tk_selected = tk_by_id.get(tk_job_id.strip())
                         if tk_selected:
                             st.success(f"**{get_opening_name(tk_selected)}** (ID: {tk_selected['id']})")
+                            # Remember the actively-selected opening (NOT persisted to disk —
+                            # this is current-session only) so the stale-pull guard below
+                            # can compare it against the persisted `pulled_opening_id`.
+                            st.session_state["_active_tk_opening_id"] = str(tk_selected["id"])
+                            st.session_state["_active_tk_opening_title"] = get_opening_name(tk_selected) or ""
                         else:
                             st.warning(f"No active opening with ID {tk_job_id}")
 
@@ -567,6 +599,10 @@ with col2:
                             # checkpoints don't merge with a previous batch's data.
                             _clear_pull_state()
                             resumes = {}
+                            # Tag the pull so the eval block can detect a later
+                            # opening switch and refuse to score against the wrong rubric.
+                            st.session_state["pulled_opening_id"] = str(tk_selected["id"])
+                            st.session_state["pulled_opening_title"] = get_opening_name(tk_selected) or ""
                             progress = st.progress(0)
                             status = st.empty()
                             downloaded = 0
@@ -634,6 +670,40 @@ st.markdown("---")
 # RUN EVALUATION
 # ─────────────────────────────────────────────
 
+# Stale-pull guard: if the user has actively selected a Trakstar opening THIS session
+# but the persisted `pulled_resumes` was tagged from a DIFFERENT opening, refuse to
+# evaluate. Without this guard, sales resumes get scored against a finance rubric
+# (real bug, May 2026 — Roohani Raj Madan): the eval block reads `pulled_resumes`
+# regardless of which opening is currently selected, so a stale pull from yesterday
+# silently overrides today's selection.
+_stale_pull_mismatch = None
+_pulled_oid_for_check = (st.session_state.get("pulled_opening_id") or "").strip()
+_active_oid_for_check = (st.session_state.get("_active_tk_opening_id") or "").strip()
+if (
+    resumes
+    and _pulled_oid_for_check
+    and _active_oid_for_check
+    and _pulled_oid_for_check != _active_oid_for_check
+):
+    _stale_pull_mismatch = {
+        "pulled_id": _pulled_oid_for_check,
+        "pulled_title": st.session_state.get("pulled_opening_title") or "(unknown)",
+        "active_id": _active_oid_for_check,
+        "active_title": st.session_state.get("_active_tk_opening_title") or "(unknown)",
+    }
+
+if _stale_pull_mismatch:
+    st.error(
+        f"🛑 **Stale pull detected — evaluation blocked.**\n\n"
+        f"The {len(resumes)} loaded resumes were pulled from "
+        f"**{_stale_pull_mismatch['pulled_title']}** (ID: {_stale_pull_mismatch['pulled_id']}), "
+        f"but you've now selected **{_stale_pull_mismatch['active_title']}** "
+        f"(ID: {_stale_pull_mismatch['active_id']}).\n\n"
+        f"Evaluating now would score the wrong candidates against this opening's rubric. "
+        f"Click **Discard** on the restore banner above (or the Pull button) to clear the "
+        f"stale resumes, then re-pull from the current opening."
+    )
+
 # Show clear status of what's missing before the button
 ready_checks = []
 if not framework_name:
@@ -644,6 +714,11 @@ if not jd_text:
     ready_checks.append("Job Description not uploaded or text extraction failed")
 if len(resumes) == 0:
     ready_checks.append("No resumes loaded — upload a ZIP or pull from Trakstar")
+if _stale_pull_mismatch:
+    ready_checks.append(
+        f"Pulled resumes are from a different opening "
+        f"({_stale_pull_mismatch['pulled_title']}) — discard and re-pull"
+    )
 
 if ready_checks:
     st.warning("**Cannot evaluate yet:** " + " · ".join(ready_checks))
